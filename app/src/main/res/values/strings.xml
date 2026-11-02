@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CCS Node Dump</string>
+    <string name="dump_service_label">CCS Node Dump</string>
+    <string name="dump_service_description">Writes the on-screen UI structure to Downloads for debugging.</string>
+</resources>
