@@ -74,7 +74,9 @@ object Sync {
 
         val trip = try {
             val ocr = Ocr.read(c, uri)
-            TripParser.parse(ocr.words, ocr.imageWidth, AirportZones.get(c))
+            val t = TripParser.parse(ocr.words, ocr.imageWidth, AirportZones.get(c))
+            if (looksLikeTripPage(ocr.words)) Diagnostics.save(c, ocr, t)
+            t
         } catch (e: Exception) {
             return Outcome.Failed("Couldn't read the screenshot: ${e.message}")
         } ?: return Outcome.NotATrip
@@ -105,6 +107,11 @@ object Sync {
         Prefs.addLog(c, line)
         if (notify) Notifier.show(c, "${trip.pairing} added to your calendar", line)
         Outcome.Added(trip, n, cal.name)
+    }
+
+    private fun looksLikeTripPage(words: List<TripParser.Word>): Boolean {
+        val all = words.joinToString(" ") { it.text }.uppercase(Locale.US)
+        return all.contains("REPORT") || all.contains("CHECK-IN") || all.contains("LAYOVER")
     }
 
     /** When a shared image was taken, from the phone's photo records or its file name. */
@@ -222,5 +229,44 @@ object Notifier {
             .setAutoCancel(true)
             .build()
         nm.notify((System.currentTimeMillis() % 100000).toInt(), n)
+    }
+}
+
+/**
+ * Saves exactly what the text reader saw on a trip page, plus what was made of
+ * it, to Downloads/ccs-sync/ so problems can be checked. Text only, stays on the phone.
+ */
+object Diagnostics {
+    fun save(c: Context, ocr: Ocr.Result, trip: TripParser.Trip?) {
+        try {
+            val sb = StringBuilder()
+            sb.append("width ").append(ocr.imageWidth).append('\n')
+            if (trip == null) sb.append("RESULT: not read as a trip\n")
+            else {
+                sb.append("RESULT: ").append(trip.pairing).append(' ').append(trip.startDate)
+                    .append(", ").append(trip.duties.size).append(" duty day(s)\n")
+                for (d in trip.duties) {
+                    sb.append("  duty ").append(d.number).append(" report ").append(d.report).append('\n')
+                    for (l in d.legs) sb.append("    ").append(l).append('\n')
+                }
+                if (trip.warnings.isNotEmpty()) sb.append("  warnings: ").append(trip.warnings).append('\n')
+            }
+            sb.append("WORDS (left top right bottom text)\n")
+            for (w in ocr.words) {
+                sb.append(w.left).append('\t').append(w.top).append('\t').append(w.right).append('\t')
+                    .append(w.bottom).append('\t').append(w.text).append('\n')
+            }
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(java.util.Date())
+            val name = "read_" + (trip?.pairing ?: "unknown") + "_" + stamp + ".txt"
+            val values = android.content.ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/ccs-sync")
+            }
+            val out = c.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+            c.contentResolver.openOutputStream(out)?.use { it.write(sb.toString().toByteArray()) }
+        } catch (e: Exception) {
+            // diagnostics must never break syncing
+        }
     }
 }
