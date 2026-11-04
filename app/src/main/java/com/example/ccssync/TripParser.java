@@ -279,6 +279,15 @@ public final class TripParser {
             else if (from[k + 1] == null) from[k + 1] = to[k];
         }
 
+        // Trips start and end at the crew base. If the first departure isn't a
+        // United station but the last arrival is, the first one was misread.
+        int lastIdx = allLegs.size() - 1;
+        if (lastIdx > 0 && to[lastIdx] != null && PREFERRED.contains(to[lastIdx])
+            && (from[0] == null || !PREFERRED.contains(from[0]))) {
+            trip.warnings.add("Read first airport as " + from[0] + ", assumed base " + to[lastIdx]);
+            from[0] = to[lastIdx];
+        }
+
         // Turn local clock times into real moments.
         ZonedDateTime prevEnd = null;
         int legIndex = 0;
@@ -453,6 +462,20 @@ public final class TripParser {
                 if (raw.charAt(i) == c[0].charAt(0)) {
                     String v = raw.substring(0, i) + c[1] + raw.substring(i + 1);
                     if (PREFERRED.contains(v)) return v;
+                }
+            }
+        }
+        // Two misread letters (e.g. "SEQ" for SFO: E/F and Q/O).
+        for (int i = 0; i < 3; i++) {
+            for (String[] c1 : CONFUSIONS) {
+                if (raw.charAt(i) != c1[0].charAt(0)) continue;
+                String v1 = raw.substring(0, i) + c1[1] + raw.substring(i + 1);
+                for (int j = i + 1; j < 3; j++) {
+                    for (String[] c2 : CONFUSIONS) {
+                        if (v1.charAt(j) != c2[0].charAt(0)) continue;
+                        String v2 = v1.substring(0, j) + c2[1] + v1.substring(j + 1);
+                        if (PREFERRED.contains(v2)) return v2;
+                    }
                 }
             }
         }
