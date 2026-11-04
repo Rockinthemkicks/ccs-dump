@@ -168,7 +168,7 @@ class MainActivity : Activity() {
         android.app.AlertDialog.Builder(this)
             .setTitle("Rebuild calendar?")
             .setMessage(
-                "This removes every trip this app added to your calendar (nothing else), then " +
+                "This removes every trip this app added, in any of your calendars (nothing else), then " +
                     "re-reads your screenshots from the last 30 days, oldest first, so the newest " +
                     "version of each day wins.\n\nTip: delete old CCS screenshots you don't need first."
             )

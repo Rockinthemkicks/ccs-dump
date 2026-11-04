@@ -49,16 +49,21 @@ object CalendarStore {
 
     private fun tag(trip: TripParser.Trip, shotMillis: Long) = "[ccs-sync:${trip.key()}@$shotMillis]"
 
-    private class AppEvent(val id: Long, val start: Long, val end: Long, val pairing: String?, val key: String?, val shot: Long)
+    private class AppEvent(
+        val id: Long, val start: Long, val end: Long, val pairing: String?, val key: String?, val shot: Long,
+        val title: String
+    )
 
     private fun appEvents(context: Context, calId: Long, from: Long, to: Long): List<AppEvent> {
         val out = ArrayList<AppEvent>()
         context.contentResolver.query(
             Events.CONTENT_URI,
             arrayOf(Events._ID, Events.DTSTART, Events.DTEND, Events.TITLE, Events.DESCRIPTION),
-            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND $APP_EVENTS AND " +
+            // Every calendar, not just the chosen one: after switching calendars
+            // (or a reinstall resetting the choice) old copies live elsewhere.
+            "${Events.DELETED} = 0 AND $APP_EVENTS AND " +
                 "${Events.DTSTART} < ? AND ${Events.DTSTART} > ?",
-            arrayOf(calId.toString(), to.toString(), from.toString()), null
+            arrayOf(to.toString(), from.toString()), null
         )?.use { c ->
             while (c.moveToNext()) {
                 val title = c.getString(3) ?: ""
@@ -67,7 +72,8 @@ object CalendarStore {
                 val key = m?.groupValues?.get(1)
                 val pairing = key?.substringBefore(':') ?: TITLE.find(title)?.groupValues?.get(1)
                 val end = if (c.isNull(2)) c.getLong(1) else c.getLong(2)
-                out.add(AppEvent(c.getLong(0), c.getLong(1), end, pairing, key, m?.groupValues?.get(2)?.toLongOrNull() ?: 0L))
+                out.add(AppEvent(c.getLong(0), c.getLong(1), end, pairing, key,
+                    m?.groupValues?.get(2)?.toLongOrNull() ?: 0L, title))
             }
         }
         return out
@@ -125,8 +131,20 @@ object CalendarStore {
             }
             cr.insert(Events.CONTENT_URI, v)
         }
+        removeExactDuplicates(context, newStart - 12 * day, newEnd + 12 * day)
+
         val removed = toRemove.mapNotNull { it.pairing }.filter { it != trip.pairing }.distinct()
         return WriteResult(events.size, removed, newerShotExists = false)
+    }
+
+    /** Safety net: if the same duty day exists more than once, keep only the newest copy. */
+    private fun removeExactDuplicates(context: Context, from: Long, to: Long) {
+        val all = appEvents(context, -1, from, to)
+        all.groupBy { Triple(it.title, it.start, it.end) }.values.forEach { copies ->
+            copies.sortedByDescending { it.id }.drop(1).forEach {
+                context.contentResolver.delete(ContentUris.withAppendedId(Events.CONTENT_URI, it.id), null, null)
+            }
+        }
     }
 
     /** Removes everything this app has added to the calendar (for a clean rebuild). */
@@ -135,8 +153,8 @@ object CalendarStore {
         val ids = ArrayList<Long>()
         context.contentResolver.query(
             Events.CONTENT_URI, arrayOf(Events._ID),
-            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND $APP_EVENTS",
-            arrayOf(calId.toString()), null
+            "${Events.DELETED} = 0 AND $APP_EVENTS",
+            null, null
         )?.use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
         for (id in ids) n += context.contentResolver.delete(ContentUris.withAppendedId(Events.CONTENT_URI, id), null, null)
         return n

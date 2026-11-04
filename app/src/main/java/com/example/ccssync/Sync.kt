@@ -45,6 +45,7 @@ object Prefs {
 object Sync {
     private val lock = Any()
     private val DAY = DateTimeFormatter.ofPattern("EEE MMM d", Locale.US)
+    private val HM = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
 
     sealed class Outcome {
         class Added(val trip: TripParser.Trip, val events: Int, val calendar: String) : Outcome()
@@ -94,6 +95,13 @@ object Sync {
         var line = "Added ${trip.pairing} (${DAY.format(start)}): $n duty day${if (n == 1) "" else "s"} to ${cal.name}"
         if (result.removedTrips.isNotEmpty()) line += ". Replaced " + result.removedTrips.distinct().joinToString()
         if (trip.warnings.isNotEmpty()) line += ". Check: " + trip.warnings.joinToString("; ")
+        // Each duty day exactly as written, in local airport times.
+        for (d in trip.duties) {
+            val first = d.legs.first()
+            val last = d.legs.last()
+            line += "\n   ${DAY.format(d.report)}: rpt ${HM.format(d.report)} ${first.from} → " +
+                "rel ${HM.format(d.end())} ${last.to} (${d.legs.size} seg)"
+        }
         Prefs.addLog(c, line)
         if (notify) Notifier.show(c, "${trip.pairing} added to your calendar", line)
         Outcome.Added(trip, n, cal.name)
