@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "com.example.ccsdump"
+    namespace = "com.example.ccssync"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.ccsdump"
+        applicationId = "com.example.ccssync"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
     }
 
     compileOptions {
@@ -22,4 +22,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // On-device text recognition with the model bundled in the app (no download, works offline).
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }
