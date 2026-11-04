@@ -136,6 +136,7 @@ public final class TripParser {
         double y;
         LocalTime report;
         LocalDate date;
+        Duration layoverBefore; // "Layover 15:45" shown just above this duty
         final List<RawLeg> legs = new ArrayList<>();
     }
 
@@ -156,7 +157,7 @@ public final class TripParser {
             Matcher m = HEADER.matcher(r.joined().toUpperCase(Locale.US));
             if (m.find()) {
                 String code = m.group(1);
-                if (code.matches(".*[A-Z].*") && code.matches(".*\\d.*") && !code.startsWith("UA")) {
+                if (code.matches("^[A-Z].*") && !code.startsWith("UA")) {
                     trip.pairing = code;
                     trip.startDate = toDate(m.group(2), m.group(3), m.group(4));
                     break;
@@ -166,9 +167,19 @@ public final class TripParser {
 
         // Walk rows top to bottom: "Report" rows start duty periods, "UA ####" rows are flights.
         List<RawDuty> duties = new ArrayList<>();
+        Duration pendingLayover = null;
         for (int i = 0; i < rows.size(); i++) {
             Row r = rows.get(i);
             String joinedUpper = r.joined().toUpperCase(Locale.US);
+
+            if (joinedUpper.contains("LAYOVER")) {
+                Matcher lm = Pattern.compile("LAYOVER\\D*(\\d{1,3}):(\\d{2})").matcher(joinedUpper);
+                if (lm.find()) {
+                    pendingLayover = Duration.ofHours(Integer.parseInt(lm.group(1)))
+                        .plusMinutes(Integer.parseInt(lm.group(2)));
+                }
+                continue;
+            }
 
             boolean isDpHeader = joinedUpper.matches(".*\\bDP\\s*\\d.*");
             boolean hasReport = joinedUpper.contains("REPORT");
@@ -177,6 +188,8 @@ public final class TripParser {
                 if (d == null) {
                     d = new RawDuty();
                     d.y = r.cy;
+                    d.layoverBefore = pendingLayover;
+                    pendingLayover = null;
                     duties.add(d);
                 }
                 if (hasReport) {
@@ -192,18 +205,23 @@ public final class TripParser {
                 continue;
             }
 
-            String flight = flightNumber(r.words);
-            if (flight == null) continue;
-
-            RawLeg leg = new RawLeg();
-            leg.flight = flight;
-            leg.y = r.cy;
-
             List<Word> times = new ArrayList<>();
             for (Word w : r.words) {
                 if (time(w.text) != null && w.cx() > W * 0.25 && w.cx() < W * 0.63) times.add(w);
             }
             times.sort(Comparator.comparingDouble(Word::cx));
+            String flight = flightNumber(r.words);
+            // Segments: a UA flight, or any row under a duty header with a departure
+            // and arrival time (deadheads, ground transport like "H FAKE").
+            if (flight == null) {
+                if (duties.isEmpty() || times.size() < 2) continue;
+                flight = segmentLabel(r.words, W);
+                if (flight == null) continue;
+            }
+
+            RawLeg leg = new RawLeg();
+            leg.flight = flight;
+            leg.y = r.cy;
             if (times.size() >= 2) {
                 leg.depTime = times.get(0).text;
                 leg.arrTime = times.get(1).text;
@@ -213,7 +231,7 @@ public final class TripParser {
             List<Word> codes = new ArrayList<>();
             for (int j = i + 1; j < rows.size() && j <= i + 2; j++) {
                 Row below = rows.get(j);
-                if (flightNumber(below.words) != null) break;
+                if (flightNumber(below.words) != null || countMidTimes(below.words, W) >= 2) break;
                 for (Word w : below.words) {
                     if (w.cx() > W * 0.28 && w.cx() < W * 0.66 && airportish(w.text) != null) codes.add(w);
                 }
@@ -283,7 +301,7 @@ public final class TripParser {
         // United station but the last arrival is, the first one was misread.
         int lastIdx = allLegs.size() - 1;
         if (lastIdx > 0 && to[lastIdx] != null && PREFERRED.contains(to[lastIdx])
-            && (from[0] == null || !PREFERRED.contains(from[0]))) {
+            && from[0] != null && !PREFERRED.contains(from[0])) {
             trip.warnings.add("Read first airport as " + from[0] + ", assumed base " + to[lastIdx]);
             from[0] = to[lastIdx];
         }
@@ -306,6 +324,11 @@ public final class TripParser {
             if (date == null && di == 0) date = trip.startDate;
 
             LocalTime reportTime = rd.report;
+            if (reportTime == null && rd.layoverBefore != null && prevEnd != null) {
+                // Report = previous release + the layover CCS shows (exact, even when
+                // the report time itself is covered on screen).
+                reportTime = prevEnd.plus(rd.layoverBefore).withZoneSameInstant(firstZone).toLocalTime();
+            }
             if (reportTime == null && firstDep != null) {
                 reportTime = firstDep.minusMinutes(60);
                 trip.warnings.add("Duty " + duty.number + ": no report time found, using 1 hour before departure");
@@ -396,6 +419,25 @@ public final class TripParser {
         RawDuty d = duties.get(duties.size() - 1);
         // "DP 01 ... Report 15:50" can split into two rows; treat them as one header.
         return d.legs.isEmpty() && Math.abs(d.y - y) < Math.max(rowH, 10) * 2.5 ? d : null;
+    }
+
+    private static int countMidTimes(List<Word> rowWords, double W) {
+        int n = 0;
+        for (Word w : rowWords) if (time(w.text) != null && w.cx() > W * 0.25 && w.cx() < W * 0.63) n++;
+        return n;
+    }
+
+    /** Left-column label of a non-UA segment, e.g. "H FAKE" (day badge excluded). */
+    private static String segmentLabel(List<Word> rowWords, double W) {
+        StringBuilder sb = new StringBuilder();
+        for (Word w : rowWords) {
+            if (w.cx() < W * 0.12 || w.cx() > W * 0.32) continue;
+            String t = clean(w.text);
+            if (t.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(t);
+        }
+        return sb.length() == 0 ? "Segment" : sb.toString();
     }
 
     private static String flightNumber(List<Word> rowWords) {
@@ -527,7 +569,9 @@ public final class TripParser {
             EventSpec e = new EventSpec();
             StringBuilder route = new StringBuilder(d.legs.get(0).from);
             for (Leg l : d.legs) route.append('-').append(l.to);
-            e.title = "✈ " + trip.pairing + " · " + route;
+            // Google Calendar shows events in the phone's time zone, so put the local
+            // report time (as CCS shows it) in the title.
+            e.title = "✈ " + trip.pairing + " · Rpt " + HM.format(d.report) + " · " + route;
             e.location = d.legs.get(0).from;
             e.start = d.report;
             e.end = d.end();

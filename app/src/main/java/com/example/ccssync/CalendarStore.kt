@@ -1,5 +1,6 @@
 package com.example.ccssync
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.provider.CalendarContract.Calendars
@@ -40,17 +41,46 @@ object CalendarStore {
     // Each event's description ends with [ccs-sync:<trip key>@<screenshot time ms>].
     // Events from the first version have no "@time" and count as oldest.
     private val TAG = Regex("""\[ccs-sync:([^\]@]+)(?:@(\d+))?]""")
+    // Titles start with "✈ <trip code>": used too, in case a calendar sync
+    // changed the description.
+    private val TITLE = Regex("""^\u2708\s*(\S+)""")
+    private val APP_EVENTS =
+        "(${Events.TITLE} LIKE '\u2708%' OR ${Events.DESCRIPTION} LIKE '%[ccs-sync:%')"
 
     private fun tag(trip: TripParser.Trip, shotMillis: Long) = "[ccs-sync:${trip.key()}@$shotMillis]"
+
+    private class AppEvent(val id: Long, val start: Long, val end: Long, val pairing: String?, val key: String?, val shot: Long)
+
+    private fun appEvents(context: Context, calId: Long, from: Long, to: Long): List<AppEvent> {
+        val out = ArrayList<AppEvent>()
+        context.contentResolver.query(
+            Events.CONTENT_URI,
+            arrayOf(Events._ID, Events.DTSTART, Events.DTEND, Events.TITLE, Events.DESCRIPTION),
+            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND $APP_EVENTS AND " +
+                "${Events.DTSTART} < ? AND ${Events.DTSTART} > ?",
+            arrayOf(calId.toString(), to.toString(), from.toString()), null
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val title = c.getString(3) ?: ""
+                val desc = c.getString(4) ?: ""
+                val m = TAG.find(desc)
+                val key = m?.groupValues?.get(1)
+                val pairing = key?.substringBefore(':') ?: TITLE.find(title)?.groupValues?.get(1)
+                val end = if (c.isNull(2)) c.getLong(1) else c.getLong(2)
+                out.add(AppEvent(c.getLong(0), c.getLong(1), end, pairing, key, m?.groupValues?.get(2)?.toLongOrNull() ?: 0L))
+            }
+        }
+        return out
+    }
 
     /** Result of trying to put a trip in the calendar. */
     class WriteResult(val added: Int, val removedTrips: List<String>, val newerShotExists: Boolean)
 
     /**
      * Puts the trip's duty days in the calendar so the newest screenshot wins:
-     * - Any trip this app added that overlaps the new trip (or is the same trip
-     *   code within a week) is removed entirely, all its duty days, unless it
-     *   came from a newer screenshot.
+     * - Any trip this app added that overlaps the new trip in time, or has the
+     *   same trip code within about a week, is removed entirely (all its duty
+     *   days), unless it came from a newer screenshot.
      * - If an overlapping trip came from a newer screenshot, this screenshot is
      *   out of date and nothing is changed.
      */
@@ -59,35 +89,27 @@ object CalendarStore {
         val events = TripParser.toEvents(trip)
         val newStart = events.minOf { it.start.toInstant().toEpochMilli() }
         val newEnd = events.maxOf { it.end.toInstant().toEpochMilli() }
-        val week = 7L * 24 * 60 * 60 * 1000
+        val day = 24L * 60 * 60 * 1000
 
-        // App-made events that overlap in time, or share this trip code nearby.
-        val conflicting = HashMap<String, Long>() // trip key -> its screenshot time
-        cr.query(
-            Events.CONTENT_URI, arrayOf(Events.DESCRIPTION),
-            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND ${Events.DESCRIPTION} LIKE ? AND (" +
-                "(${Events.DTSTART} < ? AND ${Events.DTEND} > ?) OR " +
-                "(${Events.DESCRIPTION} LIKE ? AND ${Events.DTSTART} BETWEEN ? AND ?))",
-            arrayOf(
-                calId.toString(), "%[ccs-sync:%",
-                newEnd.toString(), newStart.toString(),
-                "%[ccs-sync:${trip.pairing}:%", (newStart - week).toString(), (newEnd + week).toString()
-            ),
-            null
-        )?.use { c ->
-            while (c.moveToNext()) {
-                val m = TAG.find(c.getString(0) ?: "") ?: continue
-                val key = m.groupValues[1]
-                val shot = m.groupValues[2].toLongOrNull() ?: 0L
-                conflicting[key] = maxOf(conflicting[key] ?: 0L, shot)
-            }
+        val nearby = appEvents(context, calId, newStart - 12 * day, newEnd + 12 * day)
+        val week = 7 * day
+        val direct = nearby.filter { e ->
+            (e.start < newEnd && e.end > newStart) ||
+                (e.pairing == trip.pairing && e.start > newStart - week && e.start < newEnd + week)
+        }
+        // Whole trips: every event sharing a key (or, for untagged ones, a trip code) with a direct hit.
+        val keys = direct.mapNotNull { it.key }.toSet()
+        val untaggedCodes = direct.filter { it.key == null }.mapNotNull { it.pairing }.toSet()
+        val toRemove = nearby.filter { e ->
+            e in direct || (e.key != null && e.key in keys) ||
+                (e.key == null && e.pairing in untaggedCodes && e.start > newStart - week && e.start < newEnd + week)
         }
 
-        if (conflicting.values.any { it > shotMillis }) {
+        if (toRemove.any { it.shot > shotMillis }) {
             return WriteResult(0, emptyList(), newerShotExists = true)
         }
 
-        for (key in conflicting.keys) deleteTripKey(context, calId, key)
+        for (e in toRemove) cr.delete(ContentUris.withAppendedId(Events.CONTENT_URI, e.id), null, null)
 
         for (e in events) {
             val v = ContentValues().apply {
@@ -103,24 +125,20 @@ object CalendarStore {
             }
             cr.insert(Events.CONTENT_URI, v)
         }
-        val removed = conflicting.keys.filter { it != trip.key() }.map { it.substringBefore(':') }
+        val removed = toRemove.mapNotNull { it.pairing }.filter { it != trip.pairing }.distinct()
         return WriteResult(events.size, removed, newerShotExists = false)
     }
 
-    /** Removes every duty day of one trip this app added. */
-    private fun deleteTripKey(context: Context, calId: Long, key: String) {
-        context.contentResolver.delete(
-            Events.CONTENT_URI,
-            "${Events.CALENDAR_ID} = ? AND (${Events.DESCRIPTION} LIKE ? OR ${Events.DESCRIPTION} LIKE ?)",
-            arrayOf(calId.toString(), "%[ccs-sync:$key@%", "%[ccs-sync:$key]%")
-        )
-    }
-
     /** Removes everything this app has added to the calendar (for a clean rebuild). */
-    fun deleteAllAppEvents(context: Context, calId: Long): Int =
-        context.contentResolver.delete(
-            Events.CONTENT_URI,
-            "${Events.CALENDAR_ID} = ? AND ${Events.DESCRIPTION} LIKE ?",
-            arrayOf(calId.toString(), "%[ccs-sync:%")
-        )
+    fun deleteAllAppEvents(context: Context, calId: Long): Int {
+        var n = 0
+        val ids = ArrayList<Long>()
+        context.contentResolver.query(
+            Events.CONTENT_URI, arrayOf(Events._ID),
+            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND $APP_EVENTS",
+            arrayOf(calId.toString()), null
+        )?.use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
+        for (id in ids) n += context.contentResolver.delete(ContentUris.withAppendedId(Events.CONTENT_URI, id), null, null)
+        return n
+    }
 }
