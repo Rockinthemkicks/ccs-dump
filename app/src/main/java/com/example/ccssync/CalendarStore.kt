@@ -51,14 +51,14 @@ object CalendarStore {
 
     private class AppEvent(
         val id: Long, val start: Long, val end: Long, val pairing: String?, val key: String?, val shot: Long,
-        val title: String
+        val title: String, val allDay: Boolean
     )
 
     private fun appEvents(context: Context, calId: Long, from: Long, to: Long): List<AppEvent> {
         val out = ArrayList<AppEvent>()
         context.contentResolver.query(
             Events.CONTENT_URI,
-            arrayOf(Events._ID, Events.DTSTART, Events.DTEND, Events.TITLE, Events.DESCRIPTION),
+            arrayOf(Events._ID, Events.DTSTART, Events.DTEND, Events.TITLE, Events.DESCRIPTION, Events.ALL_DAY),
             // Every calendar, not just the chosen one: after switching calendars
             // (or a reinstall resetting the choice) old copies live elsewhere.
             "${Events.DELETED} = 0 AND $APP_EVENTS AND " +
@@ -73,7 +73,7 @@ object CalendarStore {
                 val pairing = key?.substringBefore(':') ?: TITLE.find(title)?.groupValues?.get(1)
                 val end = if (c.isNull(2)) c.getLong(1) else c.getLong(2)
                 out.add(AppEvent(c.getLong(0), c.getLong(1), end, pairing, key,
-                    m?.groupValues?.get(2)?.toLongOrNull() ?: 0L, title))
+                    m?.groupValues?.get(2)?.toLongOrNull() ?: 0L, title, c.getInt(5) == 1))
             }
         }
         return out
@@ -100,7 +100,7 @@ object CalendarStore {
         val nearby = appEvents(context, calId, newStart - 12 * day, newEnd + 12 * day)
         val week = 7 * day
         val direct = nearby.filter { e ->
-            (e.start < newEnd && e.end > newStart) ||
+            (!e.allDay && e.start < newEnd && e.end > newStart) ||
                 (e.pairing == trip.pairing && e.start > newStart - week && e.start < newEnd + week)
         }
         // Whole trips: every event sharing a key (or, for untagged ones, a trip code) with a direct hit.
@@ -128,6 +128,22 @@ object CalendarStore {
                 put(Events.EVENT_TIMEZONE, e.start.zone.id)
                 put(Events.EVENT_END_TIMEZONE, e.end.zone.id)
                 put(Events.AVAILABILITY, Events.AVAILABILITY_BUSY)
+            }
+            cr.insert(Events.CONTENT_URI, v)
+        }
+        // All-day bar across the days the trip covers (multi-day trips only).
+        val span = TripParser.toSpan(trip)
+        if (span.lastDay.isAfter(span.firstDay)) {
+            val utc = java.time.ZoneOffset.UTC
+            val v = ContentValues().apply {
+                put(Events.CALENDAR_ID, calId)
+                put(Events.TITLE, span.title)
+                put(Events.DESCRIPTION, span.description + tag(trip, shotMillis))
+                put(Events.ALL_DAY, 1)
+                put(Events.DTSTART, span.firstDay.atStartOfDay(utc).toInstant().toEpochMilli())
+                put(Events.DTEND, span.lastDay.plusDays(1).atStartOfDay(utc).toInstant().toEpochMilli())
+                put(Events.EVENT_TIMEZONE, "UTC")
+                put(Events.AVAILABILITY, Events.AVAILABILITY_FREE)
             }
             cr.insert(Events.CONTENT_URI, v)
         }

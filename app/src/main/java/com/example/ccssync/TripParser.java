@@ -168,20 +168,23 @@ public final class TripParser {
         // Walk rows top to bottom: "Report" rows start duty periods, "UA ####" rows are flights.
         List<RawDuty> duties = new ArrayList<>();
         Duration pendingLayover = null;
+        boolean layoverSeen = false;
         for (int i = 0; i < rows.size(); i++) {
             Row r = rows.get(i);
             String joinedUpper = r.joined().toUpperCase(Locale.US);
 
-            if (joinedUpper.contains("LAYOVER")) {
-                Matcher lm = Pattern.compile("LAYOVER\\D*(\\d{1,3}):(\\d{2})").matcher(joinedUpper);
+            if (joinedUpper.contains("LAYOVER") || joinedUpper.contains("LAY OVER")) {
+                Matcher lm = Pattern.compile("LAY\\s?OVER\\D*(\\d{1,3}):(\\d{2})").matcher(joinedUpper);
                 if (lm.find()) {
                     pendingLayover = Duration.ofHours(Integer.parseInt(lm.group(1)))
                         .plusMinutes(Integer.parseInt(lm.group(2)));
                 }
+                // A layover always ends the duty period, even if the next "DP" header is misread.
+                layoverSeen = true;
                 continue;
             }
 
-            boolean isDpHeader = joinedUpper.matches(".*\\bDP\\s*\\d.*");
+            boolean isDpHeader = joinedUpper.matches(".*\\bDP\\s*[0-9O]{1,2}\\b.*");
             boolean hasReport = joinedUpper.contains("REPORT");
             if (isDpHeader || hasReport) {
                 RawDuty d = lastDutyNear(duties, r.cy, r.bottom - r.top);
@@ -192,6 +195,7 @@ public final class TripParser {
                     pendingLayover = null;
                     duties.add(d);
                 }
+                layoverSeen = false;
                 if (hasReport) {
                     for (Word w : r.words) {
                         LocalTime t = time(w.text);
@@ -257,11 +261,14 @@ public final class TripParser {
                 if (day >= 1 && day <= 31) leg.dayOfMonth = day;
             }
 
-            if (duties.isEmpty()) {
+            if (duties.isEmpty() || (layoverSeen && !duties.get(duties.size() - 1).legs.isEmpty())) {
                 RawDuty d = new RawDuty();
                 d.y = r.cy;
+                d.layoverBefore = pendingLayover;
+                pendingLayover = null;
                 duties.add(d);
             }
+            layoverSeen = false;
             duties.get(duties.size() - 1).legs.add(leg);
         }
 
@@ -560,6 +567,45 @@ public final class TripParser {
     public static final class EventSpec {
         public String title, description, location;
         public ZonedDateTime start, end;
+    }
+
+    /** The trip as a whole, shown as an all-day bar across the days it covers. */
+    public static final class TripSpan {
+        public String title, description;
+        public LocalDate firstDay, lastDay; // inclusive
+    }
+
+    public static TripSpan toSpan(Trip trip) {
+        TripSpan t = new TripSpan();
+        Duty first = trip.duties.get(0);
+        Duty last = trip.duties.get(trip.duties.size() - 1);
+        t.firstDay = first.report.toLocalDate();
+        t.lastDay = last.end().toLocalDate();
+        if (t.lastDay.isBefore(t.firstDay)) t.lastDay = t.firstDay;
+        long days = java.time.temporal.ChronoUnit.DAYS.between(t.firstDay, t.lastDay) + 1;
+
+        StringBuilder route = new StringBuilder(first.legs.get(0).from);
+        for (int i = 0; i + 1 < trip.duties.size(); i++) {
+            Duty d = trip.duties.get(i);
+            route.append('-').append(d.legs.get(d.legs.size() - 1).to);
+        }
+        route.append('-').append(last.legs.get(last.legs.size() - 1).to);
+        t.title = "\u2708 " + trip.pairing + " \u00b7 " + days + "-day trip \u00b7 " + route;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Report ").append(HM.format(first.report)).append(' ').append(first.legs.get(0).from)
+          .append(" on ").append(first.report.toLocalDate()).append('\n');
+        sb.append("Release ").append(HM.format(last.end())).append(' ').append(last.legs.get(last.legs.size() - 1).to)
+          .append(" on ").append(last.end().toLocalDate()).append('\n');
+        for (int i = 0; i + 1 < trip.duties.size(); i++) {
+            Duty d = trip.duties.get(i);
+            Duration rest = Duration.between(d.end(), trip.duties.get(i + 1).report);
+            sb.append("Layover ").append(d.legs.get(d.legs.size() - 1).to).append(' ')
+              .append(rest.toHours()).append('h').append(String.format(Locale.US, "%02d", rest.toMinutesPart())).append('\n');
+        }
+        sb.append("Each duty day is a separate timed event.\n");
+        t.description = sb.toString();
+        return t;
     }
 
     public static List<EventSpec> toEvents(Trip trip) {
