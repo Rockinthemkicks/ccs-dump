@@ -18,11 +18,10 @@ class MainActivity : Activity() {
             setPadding(48, 48, 48, 48)
         }
         layout.addView(TextView(this).apply {
-            text = "1. Tap the button below, open \"CCS Node Dump\" and turn it on.\n" +
-                "2. On the same page, turn on \"CCS Node Dump shortcut\" " +
-                "(a small floating or nav-bar button appears).\n" +
-                "3. Open MobileCCS to the screen you want and tap that shortcut button.\n" +
-                "4. Dumps appear in Downloads/ccs-dumps/."
+            text = "1. Tap the button below, open \"CCS Node Dump\" and turn on \"Use CCS Node Dump\".\n" +
+                "2. Open MobileCCS. Each screen is saved about 3 seconds after it loads; " +
+                "your phone buzzes when it saves.\n" +
+                "3. Dumps appear in Downloads/ccs-dumps/. Other apps are ignored.\n"
             textSize = 16f
         })
         layout.addView(Button(this).apply {
