@@ -25,6 +25,7 @@ class MainActivity : Activity() {
     private lateinit var permsButton: Button
     private lateinit var calendarSpinner: Spinner
     private lateinit var scanButton: Button
+    private lateinit var rebuildButton: Button
     private lateinit var statusText: TextView
     private lateinit var logText: TextView
     private var calendars: List<CalendarStore.Cal> = emptyList()
@@ -68,6 +69,12 @@ class MainActivity : Activity() {
         }
         col.addView(scanButton)
 
+        rebuildButton = Button(this).apply {
+            text = "Rebuild calendar from screenshots"
+            setOnClickListener { confirmRebuild() }
+        }
+        col.addView(rebuildButton)
+
         statusText = text("")
         col.addView(statusText)
         col.addView(text("Recent activity", bold = true))
@@ -103,6 +110,7 @@ class MainActivity : Activity() {
         permsButton.visibility = if (photos && cal && notif) View.GONE else View.VISIBLE
         permsButton.text = "Allow access"
         scanButton.isEnabled = photos && cal
+        rebuildButton.isEnabled = photos && cal
 
         if (cal) {
             calendars = CalendarStore.writableCalendars(this)
@@ -156,6 +164,32 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun confirmRebuild() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Rebuild calendar?")
+            .setMessage(
+                "This removes every trip this app added to your calendar (nothing else), then " +
+                    "re-reads your screenshots from the last 30 days, oldest first, so the newest " +
+                    "version of each day wins.\n\nTip: delete old CCS screenshots you don't need first."
+            )
+            .setPositiveButton("Rebuild") { _, _ ->
+                statusText.text = "Rebuilding… this can take a minute."
+                worker.execute {
+                    val (removed, results) = try {
+                        Sync.rebuild(applicationContext, 30)
+                    } catch (e: Exception) {
+                        0 to listOf(Sync.Outcome.Failed(e.message ?: "error"))
+                    }
+                    runOnUiThread {
+                        statusText.text = "Removed $removed old event${if (removed == 1) "" else "s"}.\n" + summarize(results)
+                        refresh()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun handleShare(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
         @Suppress("DEPRECATION")
@@ -163,7 +197,8 @@ class MainActivity : Activity() {
         else intent.getParcelableExtra(Intent.EXTRA_STREAM)) ?: return
         statusText.text = "Reading the shared screenshot…"
         worker.execute {
-            val r = Sync.processImage(applicationContext, uri, notify = false)
+            val r = Sync.processImage(applicationContext, uri, notify = false,
+                shotMillis = Sync.shotTimeOf(applicationContext, uri))
             runOnUiThread {
                 statusText.text = summarize(listOf(r))
                 refresh()
@@ -175,9 +210,13 @@ class MainActivity : Activity() {
     private fun summarize(results: List<Sync.Outcome>): String {
         val added = results.filterIsInstance<Sync.Outcome.Added>()
         val failed = results.filterIsInstance<Sync.Outcome.Failed>()
+        val outdated = results.filterIsInstance<Sync.Outcome.Outdated>()
+        val skipped = if (outdated.isNotEmpty())
+            "\nSkipped as out of date: " + outdated.joinToString { it.trip.pairing } else ""
         return when {
-            added.isNotEmpty() -> "Updated: " + added.joinToString { it.trip.pairing } +
+            added.isNotEmpty() -> "Updated: " + added.joinToString { it.trip.pairing } + skipped +
                 (if (failed.isNotEmpty()) "\nProblems: " + failed.joinToString { it.message } else "")
+            outdated.isNotEmpty() -> "Nothing changed." + skipped
             failed.isNotEmpty() -> "Problem: " + failed.joinToString { it.message }
             results.isEmpty() -> "No new screenshots."
             else -> "No CCS trip pages in the new screenshots."

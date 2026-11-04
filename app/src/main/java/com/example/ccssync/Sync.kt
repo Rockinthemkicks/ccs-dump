@@ -48,6 +48,7 @@ object Sync {
 
     sealed class Outcome {
         class Added(val trip: TripParser.Trip, val events: Int, val calendar: String) : Outcome()
+        class Outdated(val trip: TripParser.Trip) : Outcome()
         object NotATrip : Outcome()
         class Failed(val message: String) : Outcome()
     }
@@ -62,8 +63,11 @@ object Sync {
         c.checkSelfPermission(Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED &&
             c.checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
 
-    /** Reads one image; adds it to the calendar if it's a CCS trip page. */
-    fun processImage(c: Context, uri: Uri, notify: Boolean): Outcome = synchronized(lock) {
+    /**
+     * Reads one image; adds it to the calendar if it's a CCS trip page.
+     * @param shotMillis when the screenshot was taken; newer screenshots win.
+     */
+    fun processImage(c: Context, uri: Uri, notify: Boolean, shotMillis: Long): Outcome = synchronized(lock) {
         if (!hasCalendarPermission(c)) return Outcome.Failed("Calendar access is off. Open the app to allow it.")
         val cal = CalendarStore.chosenCalendar(c) ?: return Outcome.Failed("No calendar found to write to.")
 
@@ -74,18 +78,71 @@ object Sync {
             return Outcome.Failed("Couldn't read the screenshot: ${e.message}")
         } ?: return Outcome.NotATrip
 
-        val n = try {
-            CalendarStore.replaceTrip(c, cal.id, trip)
+        val result = try {
+            CalendarStore.replaceTrip(c, cal.id, trip, shotMillis)
         } catch (e: Exception) {
             return Outcome.Failed("Couldn't write to the calendar: ${e.message}")
         }
 
         val start = trip.duties.first().report
+        if (result.newerShotExists) {
+            Prefs.addLog(c, "Skipped ${trip.pairing} (${DAY.format(start)}): a newer screenshot already covers those days")
+            return Outcome.Outdated(trip)
+        }
+
+        val n = result.added
         var line = "Added ${trip.pairing} (${DAY.format(start)}): $n duty day${if (n == 1) "" else "s"} to ${cal.name}"
+        if (result.removedTrips.isNotEmpty()) line += ". Replaced " + result.removedTrips.distinct().joinToString()
         if (trip.warnings.isNotEmpty()) line += ". Check: " + trip.warnings.joinToString("; ")
         Prefs.addLog(c, line)
         if (notify) Notifier.show(c, "${trip.pairing} added to your calendar", line)
         Outcome.Added(trip, n, cal.name)
+    }
+
+    /** When a shared image was taken, from the phone's photo records or its file name. */
+    fun shotTimeOf(c: Context, uri: Uri): Long {
+        try {
+            c.contentResolver.query(
+                uri, arrayOf(MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED,
+                    MediaStore.Images.Media.DISPLAY_NAME), null, null, null
+            )?.use { cur ->
+                if (cur.moveToFirst()) {
+                    val taken = cur.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
+                    if (taken >= 0 && !cur.isNull(taken) && cur.getLong(taken) > 0) return cur.getLong(taken)
+                    val added = cur.getColumnIndex(MediaStore.Images.Media.DATE_ADDED)
+                    if (added >= 0 && !cur.isNull(added) && cur.getLong(added) > 0) return cur.getLong(added) * 1000
+                    val name = cur.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
+                    if (name >= 0) timeFromName(cur.getString(name))?.let { return it }
+                }
+            }
+        } catch (e: Exception) {
+            // Some apps share images without these details.
+        }
+        return System.currentTimeMillis()
+    }
+
+    private val NAME_TIME = Regex("""(20\d\d)[-_]?(\d\d)[-_]?(\d\d)[-_](\d\d)[-_]?(\d\d)[-_]?(\d\d)""")
+
+    private fun timeFromName(name: String?): Long? {
+        val m = NAME_TIME.find(name ?: return null) ?: return null
+        val (y, mo, d, h, mi, se) = m.destructured
+        return try {
+            java.time.LocalDateTime.of(y.toInt(), mo.toInt(), d.toInt(), h.toInt(), mi.toInt(), se.toInt())
+                .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Clean start: removes everything this app put in the calendar, then reads
+     * the last `days` days of screenshots oldest-first, so the newest wins.
+     */
+    fun rebuild(c: Context, days: Int): Pair<Int, List<Outcome>> = synchronized(lock) {
+        val cal = CalendarStore.chosenCalendar(c) ?: return 0 to listOf(Outcome.Failed("No calendar found."))
+        val removed = CalendarStore.deleteAllAppEvents(c, cal.id)
+        Prefs.addLog(c, "Rebuild: removed $removed old event${if (removed == 1) "" else "s"}, re-reading $days days of screenshots")
+        removed to scanNew(c, notify = false, sinceSeconds = System.currentTimeMillis() / 1000 - days * 24L * 3600)
     }
 
     /**
@@ -101,22 +158,25 @@ object Sync {
 
         val proj = arrayOf(
             MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.RELATIVE_PATH, MediaStore.Images.Media.DATE_ADDED
+            MediaStore.Images.Media.RELATIVE_PATH, MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.DATE_TAKEN
         )
         c.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj,
             "${MediaStore.Images.Media.DATE_ADDED} > ?", arrayOf(since.toString()),
-            "${MediaStore.Images.Media.DATE_ADDED} ASC"
+            "${MediaStore.Images.Media.DATE_TAKEN} ASC, ${MediaStore.Images.Media.DATE_ADDED} ASC"
         )?.use { cur ->
             while (cur.moveToNext()) {
                 val id = cur.getLong(0)
                 val name = cur.getString(1) ?: ""
                 val path = cur.getString(2) ?: ""
                 val added = cur.getLong(3)
+                val taken = if (cur.isNull(4)) 0L else cur.getLong(4)
                 newest = maxOf(newest, added)
                 if (!isCandidate(name, path)) continue
                 val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                results.add(processImage(c, uri, notify))
+                val shot = if (taken > 0) taken else added * 1000
+                results.add(processImage(c, uri, notify, shot))
             }
         }
         if (sinceSeconds == null || newest > Prefs.lastSeen(c)) Prefs.setLastSeen(c, maxOf(newest, Prefs.lastSeen(c)))
