@@ -128,6 +128,7 @@ public final class TripParser {
         String flight;
         String depTime, arrTime;
         String fromRaw, toRaw;
+        double depX = -1, arrX = -1; // where the times sit, to line up the airport codes
         Integer dayOfMonth;
         double y;
     }
@@ -137,6 +138,7 @@ public final class TripParser {
         LocalTime report;
         LocalDate date;
         Duration layoverBefore; // "Layover 15:45" shown just above this duty
+        String layoverCity;     // "... in FCA" from that same line
         final List<RawLeg> legs = new ArrayList<>();
     }
 
@@ -168,6 +170,7 @@ public final class TripParser {
         // Walk rows top to bottom: "Report" rows start duty periods, "UA ####" rows are flights.
         List<RawDuty> duties = new ArrayList<>();
         Duration pendingLayover = null;
+        String pendingLayoverCity = null;
         boolean layoverSeen = false;
         for (int i = 0; i < rows.size(); i++) {
             Row r = rows.get(i);
@@ -179,6 +182,9 @@ public final class TripParser {
                     pendingLayover = Duration.ofHours(Integer.parseInt(lm.group(1)))
                         .plusMinutes(Integer.parseInt(lm.group(2)));
                 }
+                // "15:45inFCA11/04/26": the layover city is read cleanly (no underline).
+                Matcher cm = Pattern.compile("\\d:\\d{2}\\s*IN\\s*([A-Z]{3})").matcher(joinedUpper);
+                if (cm.find()) pendingLayoverCity = cm.group(1);
                 // A layover always ends the duty period, even if the next "DP" header is misread.
                 layoverSeen = true;
                 continue;
@@ -192,7 +198,9 @@ public final class TripParser {
                     d = new RawDuty();
                     d.y = r.cy;
                     d.layoverBefore = pendingLayover;
+                    d.layoverCity = pendingLayoverCity;
                     pendingLayover = null;
+                    pendingLayoverCity = null;
                     duties.add(d);
                 }
                 layoverSeen = false;
@@ -229,6 +237,8 @@ public final class TripParser {
             if (times.size() >= 2) {
                 leg.depTime = times.get(0).text;
                 leg.arrTime = times.get(1).text;
+                leg.depX = times.get(0).cx();
+                leg.arrX = times.get(1).cx();
             }
 
             // Airport codes sit on the line under the times.
@@ -242,7 +252,17 @@ public final class TripParser {
                 if (codes.size() >= 2) break;
             }
             codes.sort(Comparator.comparingDouble(Word::cx));
-            if (codes.size() >= 2) {
+            if (leg.depX >= 0) {
+                // Each code sits under its time; match by position so one unreadable
+                // code doesn't throw off the other.
+                for (Word w : codes) {
+                    boolean nearDep = Math.abs(w.cx() - leg.depX) <= Math.abs(w.cx() - leg.arrX);
+                    double dist = Math.abs(w.cx() - (nearDep ? leg.depX : leg.arrX));
+                    if (dist > W * 0.12) continue;
+                    if (nearDep && leg.fromRaw == null) leg.fromRaw = airportish(w.text);
+                    else if (!nearDep && leg.toRaw == null) leg.toRaw = airportish(w.text);
+                }
+            } else if (codes.size() >= 2) {
                 leg.fromRaw = airportish(codes.get(0).text);
                 leg.toRaw = airportish(codes.get(1).text);
             }
@@ -265,7 +285,9 @@ public final class TripParser {
                 RawDuty d = new RawDuty();
                 d.y = r.cy;
                 d.layoverBefore = pendingLayover;
+                d.layoverCity = pendingLayoverCity;
                 pendingLayover = null;
+                pendingLayoverCity = null;
                 duties.add(d);
             }
             layoverSeen = false;
@@ -282,35 +304,52 @@ public final class TripParser {
             trip.warnings.add("Couldn't read the trip code");
         }
 
-        // Fix misread airport codes, then check flights connect.
+        // Airport codes. CCS underlines them, so text recognition often misreads
+        // them (DEN as "REN", FCA as "ESA", SFO as "SEQ") or misses one. Work from
+        // what's certain outward:
+        //   1. codes read exactly as a United station
+        //   2. layover cities ("Layover 15:45 in FCA"), which are read cleanly
+        //   3. flights connect: each departure is the previous arrival
+        //   4. fuzzy-match what's left, then connect again
+        //   5. trips start and end at the same base
         List<RawLeg> allLegs = new ArrayList<>();
-        for (RawDuty d : duties) allLegs.addAll(d.legs);
-        String[] from = new String[allLegs.size()];
-        String[] to = new String[allLegs.size()];
-        boolean[] fromSure = new boolean[allLegs.size()];
-        boolean[] toSure = new boolean[allLegs.size()];
-        for (int k = 0; k < allLegs.size(); k++) {
+        List<Integer> dutyFirstLeg = new ArrayList<>();
+        for (RawDuty d : duties) {
+            dutyFirstLeg.add(allLegs.size());
+            allLegs.addAll(d.legs);
+        }
+        int nLegs = allLegs.size();
+        String[] from = new String[nLegs];
+        String[] to = new String[nLegs];
+        for (int k = 0; k < nLegs; k++) {
             RawLeg l = allLegs.get(k);
-            from[k] = resolveAirport(l.fromRaw, airports);
-            to[k] = resolveAirport(l.toRaw, airports);
-            fromSure[k] = l.fromRaw != null && PREFERRED.contains(l.fromRaw);
-            toSure[k] = l.toRaw != null && PREFERRED.contains(l.toRaw);
+            if (l.fromRaw != null && PREFERRED.contains(l.fromRaw)) from[k] = l.fromRaw;
+            if (l.toRaw != null && PREFERRED.contains(l.toRaw)) to[k] = l.toRaw;
         }
-        for (int k = 0; k + 1 < allLegs.size(); k++) {
-            if (to[k] != null && to[k].equals(from[k + 1])) continue;
-            if (toSure[k] && !fromSure[k + 1]) from[k + 1] = to[k];
-            else if (fromSure[k + 1] && !toSure[k]) to[k] = from[k + 1];
-            else if (to[k] == null) to[k] = from[k + 1];
-            else if (from[k + 1] == null) from[k + 1] = to[k];
+        for (int di = 1; di < duties.size(); di++) {
+            String city = duties.get(di).layoverCity;
+            if (city == null) continue;
+            String c = PREFERRED.contains(city) ? city : resolveAirport(city, airports);
+            if (c == null) continue;
+            int firstLeg = dutyFirstLeg.get(di);
+            if (from[firstLeg] == null) from[firstLeg] = c;
+            if (firstLeg > 0 && to[firstLeg - 1] == null) to[firstLeg - 1] = c;
         }
-
-        // Trips start and end at the crew base. If the first departure isn't a
-        // United station but the last arrival is, the first one was misread.
-        int lastIdx = allLegs.size() - 1;
-        if (lastIdx > 0 && to[lastIdx] != null && PREFERRED.contains(to[lastIdx])
-            && from[0] != null && !PREFERRED.contains(from[0])) {
-            trip.warnings.add("Read first airport as " + from[0] + ", assumed base " + to[lastIdx]);
-            from[0] = to[lastIdx];
+        connect(from, to);
+        for (int k = 0; k < nLegs; k++) {
+            RawLeg l = allLegs.get(k);
+            if (from[k] == null) from[k] = resolveAirport(l.fromRaw, airports);
+            if (to[k] == null) to[k] = resolveAirport(l.toRaw, airports);
+        }
+        connect(from, to);
+        if (nLegs > 1) {
+            if (from[0] == null) from[0] = to[nLegs - 1];
+            if (to[nLegs - 1] == null) to[nLegs - 1] = from[0];
+            if (from[0] != null && to[nLegs - 1] != null && !from[0].equals(to[nLegs - 1])) {
+                boolean firstOk = PREFERRED.contains(from[0]), lastOk = PREFERRED.contains(to[nLegs - 1]);
+                if (lastOk && !firstOk) from[0] = to[nLegs - 1];
+                else if (firstOk && !lastOk) to[nLegs - 1] = from[0];
+            }
         }
 
         // Turn local clock times into real moments.
@@ -495,12 +534,25 @@ public final class TripParser {
         return sb.toString();
     }
 
+    /** Fills gaps so each departure matches the previous arrival. */
+    private static void connect(String[] from, String[] to) {
+        for (int pass = 0; pass < 2; pass++) {
+            for (int k = 0; k + 1 < from.length; k++) {
+                if (to[k] == null && from[k + 1] != null) to[k] = from[k + 1];
+                else if (from[k + 1] == null && to[k] != null) from[k + 1] = to[k];
+            }
+        }
+    }
+
     // Letters text recognition commonly mixes up.
     private static final String[][] CONFUSIONS = {
         {"E", "F"}, {"F", "E"}, {"Q", "O"}, {"O", "Q"}, {"O", "D"}, {"D", "O"},
         {"C", "G"}, {"G", "C"}, {"I", "L"}, {"L", "I"}, {"I", "T"}, {"T", "I"},
         {"U", "V"}, {"V", "U"}, {"M", "N"}, {"N", "M"}, {"B", "R"}, {"R", "B"},
         {"P", "R"}, {"H", "N"}, {"K", "X"}, {"W", "V"},
+        // Seen on dotted-underlined CCS codes: DEN->"REN", FCA->"ESA", SFO->"SEQ".
+        {"R", "D"}, {"D", "R"}, {"S", "C"}, {"C", "S"}, {"E", "C"}, {"A", "N"}, {"N", "A"},
+        {"S", "F"}, {"Q", "D"}, {"E", "B"}, {"B", "E"}, {"J", "I"}, {"Y", "V"},
     };
 
     static String resolveAirport(String raw, Airports airports) {
