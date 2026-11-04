@@ -23,6 +23,8 @@ import java.util.Locale
  * page to load, then writes its accessibility node tree to
  * Downloads/ccs-dumps/ccs_dump_<time>.txt. Other apps are ignored.
  *
+ * Also keeps Downloads/ccs-dumps/status_<time>.txt, a log of what it saw.
+ *
  * Read-only: never clicks or types, and the app has no internet permission.
  * A short buzz confirms each saved dump (Xiaomi can hide toasts).
  */
@@ -40,6 +42,8 @@ class NodeDumpService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        log("service started")
+        buzz()
         toast("CCS Node Dump is on. Open MobileCCS.")
     }
 
@@ -58,17 +62,51 @@ class NodeDumpService : AccessibilityService() {
 
     private val ccsCache = HashMap<String, Boolean>()
 
-    /** True for the MobileCCS app only (matched by its name or package). */
+    /**
+     * True for MobileCCS. Matches "ccs" in the app's name or package, but not
+     * this app, other home-made test apps (com.example.*), or launcher/system UI.
+     */
     private fun isCcs(pkg: String): Boolean = ccsCache.getOrPut(pkg) {
-        if (pkg == packageName) return@getOrPut false
         val label = try {
             val info = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(info).toString()
-        } catch (e: PackageManager.NameNotFoundException) {
-            ""
+        } catch (e: Exception) {
+            "?"
         }
-        label.equals("MobileCCS", ignoreCase = true) ||
-            pkg.contains("mobileccs", ignoreCase = true)
+        val match = pkg != packageName &&
+            !pkg.startsWith("com.example.") &&
+            pkg !in IGNORED_PACKAGES &&
+            (label.contains("ccs", ignoreCase = true) || pkg.contains("ccs", ignoreCase = true))
+        log("saw app: $pkg (name: $label) -> ${if (match) "CCS, will capture" else "ignored"}")
+        match
+    }
+
+    // ---- status.txt: a running log so we can see what the service is doing ----
+    private val statusLines = ArrayList<String>()
+    private var statusUri: android.net.Uri? = null
+
+    private fun log(line: String) {
+        val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        statusLines.add("$stamp  $line")
+        while (statusLines.size > 200) statusLines.removeAt(0)
+        try {
+            if (statusUri == null) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, "status_" +
+                        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".txt")
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ccs-dumps")
+                }
+                statusUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            }
+            statusUri?.let { uri ->
+                contentResolver.openOutputStream(uri, "wt")?.use {
+                    it.write(statusLines.joinToString("\n", postfix = "\n").toByteArray())
+                }
+            }
+        } catch (e: Exception) {
+            // status logging must never break the service
+        }
     }
 
     /** The MobileCCS window on screen, if any. */
@@ -85,7 +123,11 @@ class NodeDumpService : AccessibilityService() {
     private fun dumpNow() {
         val now = System.currentTimeMillis()
         if (now - lastDumpAt < MIN_GAP_MS) return
-        val root = findCcsRoot() ?: return
+        val root = findCcsRoot()
+        if (root == null) {
+            log("CCS event, but couldn't read the CCS window")
+            return
+        }
         val pkg = root.packageName?.toString() ?: "unknown"
 
         val body = StringBuilder()
@@ -116,7 +158,10 @@ class NodeDumpService : AccessibilityService() {
         val fingerprint = visibleText.toString()
             .replace(Regex("Last updated[^|]*\\|[^|]*\\|"), "")
             .hashCode()
-        if (fingerprint == lastFingerprint) return
+        if (fingerprint == lastFingerprint) {
+            log("CCS screen unchanged ($count items), not saved again")
+            return
+        }
         lastFingerprint = fingerprint
         lastDumpAt = now
 
@@ -135,6 +180,7 @@ class NodeDumpService : AccessibilityService() {
         val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
         if (uri != null) {
             contentResolver.openOutputStream(uri)?.use { it.write(sb.toString().toByteArray()) }
+            log("saved ccs_dump_$stamp.txt ($count items, ${visibleText.length} chars of text)")
             buzz()
             toast("Saved CCS screen ($count items)")
         }
@@ -154,5 +200,10 @@ class NodeDumpService : AccessibilityService() {
         private const val LOAD_DELAY_MS = 3000L // let the CCS page load
         private const val MIN_GAP_MS = 5000L
         private const val MAX_NODES = 5000
+        private val IGNORED_PACKAGES = setOf(
+            "com.miui.home",
+            "com.android.settings",
+            "com.android.systemui",
+        )
     }
 }
